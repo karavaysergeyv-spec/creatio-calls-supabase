@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 BASE = "https://terminalsua.creatio.com"
 
 # Creatio credentials
-CREATIO_LOGIN = "supportta"
+CREATIO_LOGIN = "ayushchenko"
 CREATIO_PASSWORD = "asdf1234%"
 
 # Supabase Postgres credentials
@@ -52,13 +52,18 @@ def db_connect():
     )
 
 
-def normalize_created_by(v: Any) -> str:
+def normalize_value(v: Any) -> str:
+    """Нормализация значений Creatio: и строк, и lookup-объектов {value, displayValue}."""
     if isinstance(v, dict):
-        return v.get("displayValue") or v.get("value") or ""
+        return str(v.get("displayValue") or v.get("value") or "")
     return str(v or "")
 
 
-def creatio_select_calls_by_date(session: requests.Session, day: date, row_count: int = ROW_COUNT) -> List[Dict[str, Any]]:
+def creatio_select_calls_by_date(
+    session: requests.Session,
+    day: date,
+    row_count: int = ROW_COUNT
+) -> List[Dict[str, Any]]:
     url = f"{BASE}/0/DataService/json/SyncReply/SelectQuery"
 
     headers = {
@@ -94,6 +99,7 @@ def creatio_select_calls_by_date(session: requests.Session, day: date, row_count
         },
         "columns": {
             "items": {
+                # базовые
                 "Id": {"expression": {"expressionType": 0, "columnPath": "Id"}},
                 "CreatedBy": {"expression": {"expressionType": 0, "columnPath": "CreatedBy"}},
                 "CreatedOn": {"expression": {"expressionType": 0, "columnPath": "CreatedOn"}},
@@ -101,6 +107,14 @@ def creatio_select_calls_by_date(session: requests.Session, day: date, row_count
                 "CallerId": {"expression": {"expressionType": 0, "columnPath": "CallerId"}},
                 "CalledId": {"expression": {"expressionType": 0, "columnPath": "CalledId"}},
                 "Duration": {"expression": {"expressionType": 0, "columnPath": "Duration"}},
+
+                # новые колонки — ТОЧНО как в payload реестра
+                "VvtOperatorScore": {"expression": {"expressionType": 0, "columnPath": "VvtOperatorScore"}},
+                "CaseCategory": {"expression": {"expressionType": 0, "columnPath": "Case.Category"}},
+                "CaseSubcategory": {"expression": {"expressionType": 0, "columnPath": "Case.IbCaseSubCategory"}},
+                "CaseOperationNo": {"expression": {"expressionType": 0, "columnPath": "Case.IbOperationNo"}},
+                "CaseIbService": {"expression": {"expressionType": 0, "columnPath": "Case.IbService"}},
+                "VvtQueueTitle": {"expression": {"expressionType": 0, "columnPath": "VvtQueueTitle"}},
             }
         },
         "rowCount": row_count,
@@ -203,11 +217,19 @@ def upsert_call_and_audio(conn, row: Dict[str, Any], audio_bytes: Optional[bytes
 
     call_id = row["Id"]
     created_on = row.get("CreatedOn")
-    created_by = normalize_created_by(row.get("CreatedBy"))
+    created_by = normalize_value(row.get("CreatedBy"))
     direction = str(row.get("Direction"))
     caller = str(row.get("CallerId"))
     called = str(row.get("CalledId"))
     duration = int(row.get("Duration") or 0)
+
+    # новые поля
+    operator_score = int(row.get("VvtOperatorScore") or 0)
+    case_category = normalize_value(row.get("CaseCategory"))
+    case_subcategory = normalize_value(row.get("CaseSubcategory"))
+    case_operation_code = normalize_value(row.get("CaseOperationNo"))
+    case_display = normalize_value(row.get("CaseIbService"))  # ✅ IbService
+    queue_display = normalize_value(row.get("VvtQueueTitle"))
 
     has_audio = audio_bytes is not None
     audio_size = len(audio_bytes) if audio_bytes else None
@@ -218,10 +240,11 @@ def upsert_call_and_audio(conn, row: Dict[str, Any], audio_bytes: Optional[bytes
         """
         INSERT INTO calls (
           id, created_on, created_by, direction, from_number, to_number, duration_seconds,
+          operator_score, case_category, case_subcategory, case_operation_code, case_display, queue_display,
           has_audio, audio_mime, audio_size_bytes, audio_sha256,
           updated_at
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
         ON CONFLICT (id) DO UPDATE SET
           created_on = EXCLUDED.created_on,
           created_by = EXCLUDED.created_by,
@@ -229,6 +252,12 @@ def upsert_call_and_audio(conn, row: Dict[str, Any], audio_bytes: Optional[bytes
           from_number = EXCLUDED.from_number,
           to_number = EXCLUDED.to_number,
           duration_seconds = EXCLUDED.duration_seconds,
+          operator_score = EXCLUDED.operator_score,
+          case_category = EXCLUDED.case_category,
+          case_subcategory = EXCLUDED.case_subcategory,
+          case_operation_code = EXCLUDED.case_operation_code,
+          case_display = EXCLUDED.case_display,
+          queue_display = EXCLUDED.queue_display,
           has_audio = EXCLUDED.has_audio,
           audio_mime = EXCLUDED.audio_mime,
           audio_size_bytes = EXCLUDED.audio_size_bytes,
@@ -237,6 +266,7 @@ def upsert_call_and_audio(conn, row: Dict[str, Any], audio_bytes: Optional[bytes
         """,
         (
             call_id, created_on, created_by, direction, caller, called, duration,
+            operator_score, case_category, case_subcategory, case_operation_code, case_display, queue_display,
             has_audio, audio_mime, audio_size, audio_sha256
         )
     )
@@ -260,7 +290,7 @@ def main():
     session = make_session()
     conn = db_connect()
 
-    # окно: последние 60 минут (под запуск на :59 — без дыр)
+    # окно: последние 60 минут
     start_dt, end_dt = last_60min_window_naive()
 
     # если окно пересекает полночь — запросим 2 дня
